@@ -1,17 +1,16 @@
 import streamlit as st
 import subprocess
 import json
+import re
 from google import genai
-from google.genai import types
 from pydantic import BaseModel
 
-# 1. Configure the Mobile View
 st.set_page_config(page_title="InstaRecipe", page_icon="🍳", layout="centered")
 
 st.title("🍳 Recipe Extractor")
-st.caption("Paste an Instagram link to generate an ingredient list and cooking instructions.")
+st.caption("Paste an Instagram link to extract ingredients and instructions.")
 
-# 2. Define Data Structures
+# Data Models
 class Ingredient(BaseModel):
     item: str
     quantity: str
@@ -22,54 +21,86 @@ class Recipe(BaseModel):
     shopping_list: list[Ingredient]
     instructions: list[str]
 
-# 3. Helper to Extract Content from Instagram
 def get_instagram_caption(url: str) -> str:
     cmd = ["yt-dlp", "--dump-json", "--skip-download", url]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return ""
-    data = json.loads(result.stdout)
-    return data.get("description", "")
+    try:
+        data = json.loads(result.stdout)
+        return data.get("description", "")
+    except Exception:
+        return ""
 
-# 4. Helper to Parse with Gemini
 def parse_with_gemini(text: str, api_key: str) -> Recipe:
-    client = genai.Client(api_key=api_key)
+    # Clean whitespace from the key
+    clean_key = api_key.strip()
+    client = genai.Client(api_key=clean_key)
+    
     prompt = f"""
-    Extract the shopping list and cooking instructions from this Instagram post:
+    Extract the shopping list and cooking instructions from this text.
+    Return strictly a valid JSON object matching this exact format:
+    {{
+      "title": "Recipe Title",
+      "shopping_list": [
+        {{"item": "Garlic", "quantity": "3 cloves", "aisle": "Produce"}}
+      ],
+      "instructions": [
+        "Step 1 text",
+        "Step 2 text"
+      ]
+    }}
+
+    Categorize aisle into one of: Produce, Meat/Seafood, Dairy, Pantry, Bakery, or Other.
+    Do not wrap with markdown fences or extra explanations.
+
+    Text:
     ---
     {text}
     ---
-    Classify aisle names into: Produce, Meat/Seafood, Dairy, Pantry, or Bakery.
     """
+    
+    # Request JSON response format
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=Recipe,
-        ),
+        config={"response_mime_type": "application/json"}
     )
-    return Recipe.model_validate_json(response.text)
+    
+    raw_text = response.text.strip()
+    # Strip markdown if present
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```[a-zA-Z]*\n", "", raw_text)
+        raw_text = re.sub(r"\n```$", "", raw_text)
+    
+    parsed_json = json.loads(raw_text)
+    return Recipe.model_validate(parsed_json)
 
-# 5. UI Elements
-api_key = st.secrets.get("GEMINI_API_KEY") if "GEMINI_API_KEY" in st.secrets else st.text_input("Gemini API Key", type="password")
-post_url = st.text_input("Instagram URL", placeholder="https://www.instagram.com/reel/...")
+# Check secrets or allow manual input
+saved_key = st.secrets.get("GEMINI_API_KEY", "")
+api_key = saved_key if saved_key else st.text_input("Gemini API Key", type="password")
+
+post_url = st.text_input("Instagram URL", placeholder="[https://www.instagram.com/reel/](https://www.instagram.com/reel/)...")
 
 if st.button("Extract Recipe", type="primary", use_container_width=True):
     if not post_url:
         st.warning("Please enter an Instagram link first.")
     elif not api_key:
-        st.error("Please provide a Gemini API key.")
+        st.error("Missing Gemini API Key. Add it to Streamlit Secrets or enter it above.")
     else:
-        with st.spinner("Extracting post and formatting recipe..."):
+        with st.spinner("Extracting content and parsing recipe..."):
             caption = get_instagram_caption(post_url)
             if not caption:
-                st.error("Could not fetch caption. Ensure the link is public.")
+                st.error("Could not fetch caption. Ensure the link is public and yt-dlp can reach it.")
             else:
-                recipe = parse_with_gemini(caption, api_key)
-                st.session_state["recipe"] = recipe
+                try:
+                    recipe = parse_with_gemini(caption, api_key)
+                    st.session_state["recipe"] = recipe
+                except Exception as e:
+                    # Displays the real unredacted Google error message
+                    st.error(f"Error communicating with Gemini: {str(e)}")
 
-# 6. Display Output
+# Display Recipe
 if "recipe" in st.session_state:
     rec = st.session_state["recipe"]
     st.header(rec.title)
@@ -77,7 +108,6 @@ if "recipe" in st.session_state:
     tab1, tab2 = st.tabs(["🛒 Shopping List", "👨‍🍳 Instructions"])
     
     with tab1:
-        # Group ingredients by aisle
         by_aisle = {}
         for ing in rec.shopping_list:
             by_aisle.setdefault(ing.aisle, []).append(ing)
