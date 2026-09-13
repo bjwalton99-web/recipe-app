@@ -62,7 +62,7 @@ def parse_with_gemini(text: str, api_key: str) -> Recipe:
     
     # Request JSON response format
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         contents=prompt,
         config={"response_mime_type": "application/json"}
     )
